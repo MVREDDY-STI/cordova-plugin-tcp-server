@@ -1,0 +1,23 @@
+{
+  "name": "tcpserver",
+  "version": "1.0.0",
+  "description": "This is the android and iOS cordova plugin to act as a TCP/IP Server to receive messages from the TCP/IP client",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MVREDDY-STI/cordova-plugin-tcp-server.git"
+  },
+  "keywords": [
+    "tcp/ip",
+    "socket"
+  ],
+  "author": "venkat",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/MVREDDY-STI/cordova-plugin-tcp-server/issues"
+  },
+  "homepage": "https://github.com/MVREDDY-STI/cordova-plugin-tcp-server#readme"
+}
