@@ -59,16 +59,21 @@ public class TCPServer extends CordovaPlugin {
     private void startServer(String message, CallbackContext callbackContext) {
         cordova.getThreadPool().execute(() -> {
             try {
-                serverSocket = new ServerSocket(8082);
-                Log.d("TcpServerPlugin", "Server is running on port 8082");
+                int port = Integer.parseInt(message);
+                if (x != (int)x)
+                {
+                    port = 8082;
+                }
+                serverSocket = new ServerSocket(port);
+                Log.d("TcpServerPlugin", "Server is running on port : "+Integer.toString(port));
                 //callbackContext.success("Server is running on port 8082");
-                PluginResult result = new PluginResult(PluginResult.Status.NO_RESULT,"Server is running on port 8082");
+                PluginResult result = new PluginResult(PluginResult.Status.NO_RESULT,"Server is running on port : "+Integer.toString(port));
                 result.setKeepCallback(true);
                 callbackContext.sendPluginResult(result);
                 while (true) {
                     Socket clientSocket = serverSocket.accept();
                     Log.d("TcpServerPlugin", "New client connected: " + clientSocket.getInetAddress().getHostAddress());
-                    PluginResult result = new PluginResult(PluginResult.Status.OK,"New client connected: " + clientSocket.getInetAddress().getHostAddress());
+                    result = new PluginResult(PluginResult.Status.OK,"New client connected: " + clientSocket.getInetAddress().getHostAddress());
                     result.setKeepCallback(true);
                     callbackContext.sendPluginResult(result);
                     clientSockets.add(clientSocket);
