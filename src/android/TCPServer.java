@@ -60,7 +60,7 @@ public class TCPServer extends CordovaPlugin {
         cordova.getThreadPool().execute(() -> {
             try {
                 int port = Integer.parseInt(message);
-                if (x != (int)x)
+                if (port != (int)port)
                 {
                     port = 8082;
                 }
