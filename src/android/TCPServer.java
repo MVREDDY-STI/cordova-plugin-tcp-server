@@ -119,6 +119,7 @@ public class TCPServer extends CordovaPlugin {
         InputStream inputStream = clientSocket.getInputStream();
         byte[] imageData = readInputStreamFully(inputStream);
         String base64String = Base64Utils.byteArrayToBase64(imageData);
+        Log.d("Image Data", base64String);
         PluginResult result = new PluginResult(PluginResult.Status.OK, base64String);
         result.setKeepCallback(true);
         callbackContext.sendPluginResult(result);
