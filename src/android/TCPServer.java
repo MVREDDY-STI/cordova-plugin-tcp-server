@@ -131,7 +131,7 @@ public class TCPServer extends CordovaPlugin {
     });
   }
 
-  public class Base64Utils {
+  public static class Base64Utils {
     public static String byteArrayToBase64(byte[] byteArray) {
       return Base64.encodeToString(byteArray, Base64.DEFAULT);
     }
