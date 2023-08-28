@@ -27,8 +27,8 @@ This is the android and iOS cordova plugin to act as a TCP/IP Server to receive 
 
   ```TypeScript
    window.cordova.plugins.TCPServer.stopServer("8082",(data:any) => {
-          console.log("DATA RECEIVED(S) : ", data);
+          console.log("Server Stopped(S) : ", data);
   },(err:any)=>{
-          console.warn("DATA RECEIVED(E)  : ", err);
+          console.warn("Server Stopped(E)  : ", err);
   });
   ```
