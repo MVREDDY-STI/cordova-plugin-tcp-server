@@ -22,5 +22,6 @@
 			</feature>
 		</config-file>
 		<source-file src="src/ios/TCPServer.m" />
+		<source-file src="src/ios/TCPServer.h" />
 	</platform>
 </plugin>
