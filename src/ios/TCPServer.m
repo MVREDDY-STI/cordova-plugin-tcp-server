@@ -1,116 +1,117 @@
-/********* TCPServer.m Cordova Plugin Implementation *******/
-
+#import "TCPServer.h"
 #import <Cordova/CDV.h>
-#import <Foundation/Foundation.h>
-#import "GCDAsyncSocket.h"
+#import <Cordova/CDVPluginResult.h>
+#import <CoreFoundation/CoreFoundation.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
-@interface TCPServer : CDVPlugin {
-  // Member variables go here.
-}
-@interface TCPServer () <GCDAsyncSocketDelegate>
+@interface TCPServer ()
 
-@property (nonatomic, strong) GCDAsyncSocket *serverSocket;
-@property (nonatomic, strong) NSMutableArray *clientSockets;
-
-- (void)coolMethod:(CDVInvokedUrlCommand*)command;
-- (void)startServer:(CDVInvokedUrlCommand*)command;
-- (void)stopServer:(CDVInvokedUrlCommand*)command;
+@property (nonatomic, assign) CFSocketRef serverSocket;
+@property (nonatomic, assign) CFSocketNativeHandle clientSocket;
+@property (nonatomic, strong) NSString *receiveCallbackId;
 
 @end
 
 @implementation TCPServer
 
-- (void)coolMethod:(CDVInvokedUrlCommand*)command
-{
-    CDVPluginResult* pluginResult = nil;
-    NSString* echo = [command.arguments objectAtIndex:0];
+static void TCPServerAcceptCallBack(CFSocketRef socket, CFSocketCallBackType type, CFDataRef address, const void *data, void *info) {
+    TCPServer *tcpServer = (__bridge TCPServer *)(info);
 
-    if (echo != nil && [echo length] > 0) {
-        pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsString:echo];
-    } else {
-        pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR];
+    if (type == kCFSocketAcceptCallBack) {
+        CFSocketNativeHandle nativeSocketHandle = *(CFSocketNativeHandle *)data;
+
+        tcpServer.clientSocket = nativeSocketHandle;
+        [tcpServer receiveMessages];
     }
-
-    [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
 }
 
-
-
-- (void)pluginInitialize {
-    self.clientSockets = [NSMutableArray array];
-}
 
 - (void)startServer:(CDVInvokedUrlCommand*)command {
-    CDVPluginResult *pluginResult = nil;
 
-    NSString* port = [command.arguments objectAtIndex:0];
-     NSLog(@"Received port: %@", port);
-
-    if (!self.serverSocket) {
-        self.serverSocket = [[GCDAsyncSocket alloc] initWithDelegate:self delegateQueue:dispatch_get_main_queue()];
-        
-        NSError *error = nil;
-        if ([self.serverSocket acceptOnPort:8082 error:&error]) {
-            NSLog(@"Server is running on port 8082");
-            pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsString:@"Server is running on port 8082"];
-            // Set the KeepCallback before sending the result will keep the callback id for further callbacks
-            [pluginResult setKeepCallbackAsBool:YES];
-            [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
-
-        } else {
-            NSLog(@"Error starting server: %@", error);
-            pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"Error starting server"];
-        }
-    } else {
-        NSLog(@"Server is already running.");
-        pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"Server is already running"];
-    }
-
-    [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
-}
-
-- (void)stopServer:(CDVInvokedUrlCommand*)command {
-    CDVPluginResult *pluginResult = nil;
-
+   NSLog(command.callbackId);
     if (self.serverSocket) {
-        [self.serverSocket disconnect];
-        self.serverSocket = nil;
-        [self.clientSockets removeAllObjects];
-        
-        NSLog(@"Server stopped.");
-        pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsString:@"Server stopped"];
-
-    } else {
-
-        NSLog(@"Server is not running.");
-        pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"Server is not running"];
-
+        NSLog(@"Server is already running.");
+        CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"Server is already running."];
+        [pluginResult setKeepCallbackAsBool:YES];
+        [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
+        return;
     }
 
-    [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
+    CFSocketContext socketContext = {0, (__bridge void *)(self), NULL, NULL, NULL};
+    self.serverSocket = CFSocketCreate(NULL, PF_INET, SOCK_STREAM, IPPROTO_TCP, kCFSocketAcceptCallBack, TCPServerAcceptCallBack, &socketContext);
+
+    if (self.serverSocket == NULL) {
+        NSLog(@"Failed to create server socket.");
+        CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"Failed to create server socket."];
+        [pluginResult setKeepCallbackAsBool:YES];
+        [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
+        return;
+    }
+
+    int yes = 1;
+    setsockopt(CFSocketGetNative(self.serverSocket), SOL_SOCKET, SO_REUSEADDR, (void *)&yes, sizeof(yes));
+
+    struct sockaddr_in serverAddress;
+    memset(&serverAddress, 0, sizeof(serverAddress));
+    serverAddress.sin_len = sizeof(serverAddress);
+    serverAddress.sin_family = AF_INET;
+    serverAddress.sin_port = htons(8082);
+    serverAddress.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    CFDataRef addressData = CFDataCreate(NULL, (const UInt8 *)&serverAddress, sizeof(serverAddress));
+    CFSocketSetAddress(self.serverSocket, addressData);
+
+    CFRunLoopSourceRef runLoopSource = CFSocketCreateRunLoopSource(kCFAllocatorDefault, self.serverSocket, 0);
+    CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, kCFRunLoopCommonModes);
+    CFRelease(runLoopSource);
+
+    NSLog(@"Server started.");
+    self.receiveCallbackId = command.callbackId;
+    CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsString:@"Server started."];
+    [pluginResult setKeepCallbackAsBool:YES];
+    [self.commandDelegate sendPluginResult:pluginResult callbackId:self.receiveCallbackId];
+
+
 }
 
-#pragma mark - GCDAsyncSocketDelegate
 
-- (void)socket:(GCDAsyncSocket *)sock didAcceptNewSocket:(GCDAsyncSocket *)newSocket {
-    NSLog(@"New client connected: %@", newSocket.connectedHost);
+- (void)receiveMessages {
+    NSMutableData *accumulatedData = [NSMutableData data];
+    uint8_t buffer[4096];
 
-    [self.clientSockets addObject:newSocket];
-    [newSocket readDataWithTimeout:-1 tag:0];
+    while (1) {
+        CFIndex bytesRead = recv(self.clientSocket, buffer, sizeof(buffer), 0);
+
+        if (bytesRead > 0) {
+            [accumulatedData appendBytes:buffer length:bytesRead];
+        } else if (bytesRead == 0) {
+            // Client disconnected
+            break;
+        } else {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // No data available for now, continue the loop
+                // Optionally add a delay or other logic here if desired
+                continue;
+            } else {
+                // Error during recv
+                NSLog(@"Error during recv: %s", strerror(errno));
+                break;
+            }
+        }
+    }
+
+    // Process and send all accumulated data in a single shot
+    if ([accumulatedData length] > 0) {
+        [self processAndSendData:accumulatedData];
+    }
 }
 
-- (void)socket:(GCDAsyncSocket *)sock didReadData:(NSData *)data withTag:(long)tag {
-    NSString *message = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-    CDVPluginResult *pluginResultMsg = nil;
-    NSLog(@"Received message from client %@: %@", sock.connectedHost, message);
-
-    // Do something with the received message, if needed
-    pluginResultMsg = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsString:message];
-    // Set the KeepCallback before sending the result will keep the callback id for further callbacks
-    [pluginResultMsg setKeepCallbackAsBool:YES];
-    [self.commandDelegate sendPluginResult:pluginResultMsg callbackId:command.callbackId];
-
-    [sock readDataWithTimeout:-1 tag:0];
+- (void)processAndSendData:(NSData *)data {
+    NSString *base64String = [data base64EncodedStringWithOptions:0];
+    CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsString:base64String];
+    [pluginResult setKeepCallbackAsBool:YES];
+    [self.commandDelegate sendPluginResult:pluginResult callbackId:self.receiveCallbackId];
 }
-
 @end
