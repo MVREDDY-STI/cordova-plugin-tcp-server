@@ -7,7 +7,7 @@ This is the android and iOS cordova plugin to act as a TCP/IP Server to receive 
 
 **Plugin Usage**
 
-**Step 2** : Declare the below line of code under the imports in the page you want to use TCP server.
+**Step 1** : Declare the below line of code under the imports in the page you want to use TCP server.
 
   ```TypeScript
   declare var window:any;
