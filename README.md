@@ -5,6 +5,22 @@ This is the android and iOS cordova plugin to act as a TCP/IP Server to receive 
 - Android
 - iOS
 
+  
+
+**Plugin Installation**
+
+Cordova :
+ ```JavaScript
+  ionic cordova plugin add https://github.com/MVREDDY-STI/cordova-plugin-tcp-server.git
+  ```
+
+Capacitor :
+ ```JavaScript
+  npm install https://github.com/MVREDDY-STI/cordova-plugin-tcp-server.git
+  ```
+
+
+
 **Plugin Usage**
 
 **Step 1** : Declare the below line of code under the imports in the page you want to use TCP server.
