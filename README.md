@@ -10,12 +10,12 @@ This is the android and iOS cordova plugin to act as a TCP/IP Server to receive 
 **Plugin Installation**
 
 Cordova :
- ```JavaScript
+ ```cli
   ionic cordova plugin add https://github.com/MVREDDY-STI/cordova-plugin-tcp-server.git
   ```
 
 Capacitor :
- ```JavaScript
+ ```cli
   npm install https://github.com/MVREDDY-STI/cordova-plugin-tcp-server.git
   ```
 
