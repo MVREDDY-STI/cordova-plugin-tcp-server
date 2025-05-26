@@ -3,154 +3,193 @@ package cordova_plugin_tcp_server;
 import org.apache.cordova.CordovaPlugin;
 import org.apache.cordova.CallbackContext;
 import org.apache.cordova.PluginResult;
-
 import org.json.JSONArray;
 import org.json.JSONException;
-import org.json.JSONObject;
-
-import android.os.Build;
-import android.util.Log;
-
-import org.apache.cordova.CallbackContext;
-import org.apache.cordova.CordovaPlugin;
-import org.apache.cordova.PluginResult;
-
-import java.io.BufferedReader;
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.io.PrintWriter;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.util.ArrayList;
+import java.net.SocketException;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 import android.util.Base64;
+import android.util.Log;
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
 
-/**
- * This class echoes a string called from JavaScript.
- */
 public class TCPServer extends CordovaPlugin {
-
   private ServerSocket serverSocket;
-  private ArrayList<Socket> clientSockets = new ArrayList<>();
-  String response;
-  int c;
+  private final ConcurrentHashMap<String, Socket> clientSockets = new ConcurrentHashMap<>();
+  private final ExecutorService threadPool = Executors.newCachedThreadPool();
+  private final AtomicBoolean isRunning = new AtomicBoolean(false);
+  private static final int DEFAULT_PORT = 54321;
+  private static final int SO_TIMEOUT = 30000;
+  private static final int BUFFER_SIZE = 8192;
 
   @Override
   public boolean execute(String action, JSONArray args, CallbackContext callbackContext) throws JSONException {
-    if (action.equals("coolMethod")) {
-      String message = args.getString(0);
-      this.coolMethod(message, callbackContext);
-      return true;
-    } else if (action.equals("startServer")) {
-      String message = args.getString(0);
-      startServer(message, callbackContext);
-      return true;
-    } else if (action.equals("stopServer")) {
-      stopServer(callbackContext);
-      return true;
-    }
-    return false;
-  }
-
-  private void coolMethod(String message, CallbackContext callbackContext) {
-    if (message != null && message.length() > 0) {
-      callbackContext.success(message);
-    } else {
-      callbackContext.error("Expected one non-empty string argument.");
+    switch (action) {
+      case "startServer":
+        int port = args.optInt(0, DEFAULT_PORT);
+        startServer(port, callbackContext);
+        return true;
+      case "stopServer":
+        stopServer(callbackContext);
+        return true;
+      case "restartServer":
+        int newPort = args.optInt(0, DEFAULT_PORT);
+        restartServer(newPort, callbackContext);
+        return true;
+      default:
+        callbackContext.error("Invalid action");
+        return false;
     }
   }
 
-  private void startServer(String message, CallbackContext callbackContext) {
-    cordova.getThreadPool().execute(() -> {
+  private void restartServer(int port, CallbackContext callbackContext) {
+    threadPool.execute(() -> {
+      if (isRunning.get()) {
+        stopServer(new CallbackContext("internal", null) {
+          @Override
+          public void sendPluginResult(PluginResult result) {
+            if (result.getStatus() == PluginResult.Status.OK.ordinal()) {
+              startServer(port, callbackContext);
+            } else {
+              callbackContext.error("Restart failed during stop phase");
+            }
+          }
+        });
+      } else {
+        startServer(port, callbackContext);
+      }
+    });
+  }
+
+  private void startServer(int port, CallbackContext callbackContext) {
+    threadPool.execute(() -> {
       try {
-        int port = Integer.parseInt(message);
-        if (port != (int) port) {
-          port = 8082;
+        // Cleanup any existing server state
+        if (isRunning.get()) {
+          forceCleanup();
         }
+
         serverSocket = new ServerSocket(port);
-        Log.d("TcpServerPlugin", "Server is running on port : " + Integer.toString(port));
-        //callbackContext.success("Server is running on port 8082");
-        PluginResult result = new PluginResult(PluginResult.Status.NO_RESULT, "Server is running on port : " + Integer.toString(port));
-        result.setKeepCallback(true);
-        callbackContext.sendPluginResult(result);
-        while (true) {
-          Socket clientSocket = serverSocket.accept();
-          Log.d("TcpServerPlugin", "New client connected: " + clientSocket.getInetAddress().getHostAddress());
-          result = new PluginResult(PluginResult.Status.OK, "New client connected: " + clientSocket.getInetAddress().getHostAddress());
-          result.setKeepCallback(true);
-          callbackContext.sendPluginResult(result);
-          clientSockets.add(clientSocket);
-          handleClientSocket(clientSocket, callbackContext);
+        serverSocket.setReuseAddress(true);
+        isRunning.set(true);
+
+        sendStatus(callbackContext, "Server running on port: " + port);
+
+        while (isRunning.get()) {
+          try {
+            Socket clientSocket = serverSocket.accept();
+            clientSocket.setSoTimeout(SO_TIMEOUT);
+            String clientKey = clientSocket.getInetAddress().getHostAddress() + ":" + clientSocket.getPort();
+
+            // Gracefully handle existing connections
+            Socket existingSocket = clientSockets.put(clientKey, clientSocket);
+            if (existingSocket != null) {
+              safeClose(existingSocket);
+            }
+
+            handleClient(clientSocket, callbackContext);
+          } catch (SocketException e) {
+            if (!isRunning.get()) break;
+            Log.e("TCPServer", "Accept error: " + e.getMessage());
+          }
         }
       } catch (IOException e) {
-        e.printStackTrace();
-        callbackContext.error("Error starting server: " + e.getMessage());
+        callbackContext.error("Start error: " + e.getMessage());
+        isRunning.set(false);
       }
     });
   }
 
   private void stopServer(CallbackContext callbackContext) {
-    cordova.getThreadPool().execute(() -> {
-      if (serverSocket != null && !serverSocket.isClosed()) {
-        try {
-          for (Socket clientSocket : clientSockets) {
-            clientSocket.close();
-          }
-          clientSockets.clear();
-          serverSocket.close();
-          Log.d("TcpServerPlugin", "Server stopped.");
-          callbackContext.success("Server stopped.");
-        } catch (IOException e) {
-          e.printStackTrace();
-          callbackContext.error("Error stopping server: " + e.getMessage());
-        }
-      } else {
-        Log.d("TcpServerPlugin", "Server is not running.");
-        callbackContext.error("Server is not running.");
+    threadPool.execute(() -> {
+      if (!isRunning.getAndSet(false)) {
+        callbackContext.error("Server not running");
+        return;
       }
-    });
-  }
 
-  private void handleClientSocket(Socket clientSocket, CallbackContext callbackContext) {
-    cordova.getThreadPool().execute(() -> {
+      clientSockets.forEach((key, socket) -> safeClose(socket));
+      clientSockets.clear();
+
       try {
-        // Read image data
-        InputStream inputStream = clientSocket.getInputStream();
-        byte[] imageData = readInputStreamFully(inputStream);
-        String base64String = Base64Utils.byteArrayToBase64(imageData);
-        Log.d("Image Data", base64String);
-        PluginResult result = new PluginResult(PluginResult.Status.OK, base64String);
-        result.setKeepCallback(true);
-        callbackContext.sendPluginResult(result);
-        clientSocket.close();
-        Log.d("TcpServerPlugin", "Connection with client " + clientSocket.getInetAddress().getHostAddress() + " closed.");
+        if (serverSocket != null && !serverSocket.isClosed()) {
+          serverSocket.close();
+        }
+        callbackContext.success("Server stopped");
       } catch (IOException e) {
-        e.printStackTrace();
+        callbackContext.error("Stop error: " + e.getMessage());
       }
     });
   }
 
-  public static class Base64Utils {
-    public static String byteArrayToBase64(byte[] byteArray) {
-      return Base64.encodeToString(byteArray, Base64.DEFAULT);
-    }
-
-    public static byte[] base64ToByteArray(String base64String) {
-      return Base64.decode(base64String, Base64.DEFAULT);
-    }
+  private void forceCleanup() {
+    isRunning.set(false);
+    clientSockets.forEach((key, socket) -> safeClose(socket));
+    clientSockets.clear();
+    safeClose(serverSocket);
   }
 
-  public static byte[] readInputStreamFully(InputStream inputStream) throws IOException {
-    ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-    byte[] buffer = new byte[4096]; // Adjust buffer size as needed
+  private void handleClient(Socket clientSocket, CallbackContext callbackContext) {
+    threadPool.execute(() -> {
+      String clientKey = clientSocket.getInetAddress().getHostAddress() + ":" + clientSocket.getPort();
+      try (InputStream input = clientSocket.getInputStream()) {
+        byte[] data = readStream(input);
+        String base64Data = Base64.encodeToString(data, Base64.NO_WRAP);
+        sendStatus(callbackContext, clientKey + "|" + base64Data);
+      } catch (IOException e) {
+        Log.e("TCPServer", "Client error: " + e.getMessage());
+      } finally {
+        safeClose(clientSocket);
+        clientSockets.remove(clientKey);
+      }
+    });
+  }
+
+  private byte[] readStream(InputStream input) throws IOException {
+    ByteArrayOutputStream output = new ByteArrayOutputStream();
+    byte[] buffer = new byte[BUFFER_SIZE];
     int bytesRead;
-
-    while ((bytesRead = inputStream.read(buffer)) != -1) {
-      outputStream.write(buffer, 0, bytesRead);
+    while ((bytesRead = input.read(buffer)) != -1) {
+      output.write(buffer, 0, bytesRead);
     }
-
-    return outputStream.toByteArray();
+    return output.toByteArray();
   }
 
+  private void safeClose(Socket socket) {
+    try {
+      if (socket != null && !socket.isClosed()) {
+        socket.shutdownInput();
+        socket.shutdownOutput();
+        socket.close();
+      }
+    } catch (IOException e) {
+      Log.e("TCPServer", "Close error: " + e.getMessage());
+    }
+  }
+
+  private void safeClose(ServerSocket socket) {
+    try {
+      if (socket != null && !socket.isClosed()) {
+        socket.close();
+      }
+    } catch (IOException e) {
+      Log.e("TCPServer", "Server close error: " + e.getMessage());
+    }
+  }
+
+  private void sendStatus(CallbackContext ctx, String message) {
+    PluginResult result = new PluginResult(PluginResult.Status.OK, message);
+    result.setKeepCallback(true);
+    ctx.sendPluginResult(result);
+  }
+
+  @Override
+  public void onDestroy() {
+    forceCleanup();
+    threadPool.shutdownNow();
+  }
 }
