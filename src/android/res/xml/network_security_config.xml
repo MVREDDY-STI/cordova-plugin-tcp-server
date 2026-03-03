@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Network Security Config – cordova-plugin-tcp-server
+    ─────────────────────────────────────────────────────
+    This plugin is a TCP SERVER — it RECEIVES connections; it does NOT make
+    outbound HTTP(S) calls.  Android's NetworkSecurityConfig only governs
+    outbound connections made by the app, so this file is largely a
+    precaution for future compatibility and to silence Lint warnings.
+
+    We allow cleartext on all private (RFC-1918) and loopback addresses so
+    that any debug tooling or WebView-based fetch from the same device to
+    localhost still works without unexpected blocks.
+-->
+<network-security-config>
+
+    <!--
+        Trust system CAs for all public traffic (default behaviour).
+        Override here only for private/local addresses.
+    -->
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+
+    <!-- Loopback – always allow cleartext (localhost testing, dev tools) -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">localhost</domain>
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">[::1]</domain>
+    </domain-config>
+
+    <!--
+        Private LAN ranges (RFC 1918).
+        Allows cleartext so that any same-device WebView fetch to a LAN IP
+        (e.g. 192.168.x.x) works without an HTTPS requirement.
+        Note: these are CLASS-level entries; Android matches by domain prefix.
+    -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">10</domain>
+        <domain includeSubdomains="true">172</domain>
+        <domain includeSubdomains="true">192.168</domain>
+    </domain-config>
+
+</network-security-config>

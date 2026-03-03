@@ -1,0 +1,23 @@
+// ─── cordova-plugin-tcp-server : Android build extras ───────────────────────
+//
+// Applied automatically by Cordova/Capacitor when the plugin is installed.
+// Cordova includes this via: apply from: "<path>/build-extras.gradle"
+// Do NOT rename this file.
+
+android {
+
+    // ── Java 8 source/target compatibility ───────────────────────────────────
+    // Required because TCPServer.java uses:
+    //   • Lambda expressions   (e.g. threadPool.execute(() -> …))
+    //   • Switch-on-String
+    //   • ConnectivityManager.NetworkCallback (API 24+, guarded by version check)
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    defaultConfig {
+        // Minimum API 21 (Android 5.0 Lollipop) – first level with full socket option support
+        minSdkVersion 21
+    }
+}

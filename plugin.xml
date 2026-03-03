@@ -1,27 +1,103 @@
 <?xml version='1.0' encoding='utf-8'?>
-<plugin id="cordova_plugin_tcp_server" version="1.0.0"
+<plugin id="cordova_plugin_tcp_server" version="2.0.0"
 	xmlns="http://apache.org/cordova/ns/plugins/1.0"
 	xmlns:android="http://schemas.android.com/apk/res/android">
+
 	<name>TCPServer</name>
+	<description>Resilient TCP/IP Server for Android and iOS with auto-recovery, network-switch handling, and descriptive error messages.</description>
+	<author>venkat</author>
+	<license>ISC</license>
+	<keywords>tcp,socket,server,network</keywords>
+	<repo>https://github.com/MVREDDY-STI/cordova-plugin-tcp-server.git</repo>
+	<issue>https://github.com/MVREDDY-STI/cordova-plugin-tcp-server/issues</issue>
+
+	<!-- Minimum Cordova CLI version that supports all plugin.xml features used here -->
+	<engines>
+		<engine name="cordova" version=">=9.0.0" />
+		<engine name="cordova-android" version=">=9.0.0" />
+		<engine name="cordova-ios"     version=">=6.0.0" />
+	</engines>
+
+	<!-- ── JS module (both platforms) ───────────────────────────────────── -->
 	<js-module name="TCPServer" src="www/TCPServer.js">
 		<clobbers target="cordova.plugins.TCPServer" />
 	</js-module>
+
+	<!-- ══════════════════════════════════════════════════
+	     ANDROID
+	══════════════════════════════════════════════════ -->
 	<platform name="android">
+
+		<!-- 1. Register plugin feature -->
 		<config-file parent="/*" target="res/xml/config.xml">
 			<feature name="TCPServer">
 				<param name="android-package" value="cordova_plugin_tcp_server.TCPServer" />
 			</feature>
 		</config-file>
-		<config-file parent="/*" target="AndroidManifest.xml" />
-		<source-file src="src/android/TCPServer.java" target-dir="src/cordova_plugin_tcp_server/TCPServer" />
+
+		<!-- 2. Manifest permissions -->
+		<config-file parent="/*" target="AndroidManifest.xml">
+			<!-- Raw TCP socket I/O -->
+			<uses-permission android:name="android.permission.INTERNET" />
+			<!-- ConnectivityManager broadcast (network change detection) -->
+			<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+			<uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+			<!-- Required on Android 9+ for switching between networks programmatically -->
+			<uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+		</config-file>
+
+		<!-- 3. Inject networkSecurityConfig attribute into <application> tag.
+		        edit-config modifies an EXISTING element's attribute (correct approach);
+		        config-file would try to INSERT a new <application> child (wrong). -->
+		<edit-config
+			file="AndroidManifest.xml"
+			target="/manifest/application"
+			mode="merge">
+			<application android:networkSecurityConfig="@xml/network_security_config" />
+		</edit-config>
+
+		<!-- 4. Deploy the network security config resource -->
+		<resource-file
+			src="src/android/res/xml/network_security_config.xml"
+			target="res/xml/network_security_config.xml" />
+
+		<!-- 5. Java source -->
+		<source-file
+			src="src/android/TCPServer.java"
+			target-dir="src/cordova_plugin_tcp_server/TCPServer" />
+
+		<!-- 6. Gradle extras: Java 8 compatibility + minSdkVersion 21.
+		        "type=gradleReference" tells cordova-android to include this
+		        file via apply from: in the app's build.gradle. -->
+		<framework
+			src="src/android/build-extras.gradle"
+			custom="true"
+			type="gradleReference" />
+
 	</platform>
+
+	<!-- ══════════════════════════════════════════════════
+	     iOS
+	══════════════════════════════════════════════════ -->
 	<platform name="ios">
+
+		<!-- 1. Register plugin feature -->
 		<config-file parent="/*" target="config.xml">
 			<feature name="TCPServer">
 				<param name="ios-package" value="TCPServer" />
 			</feature>
 		</config-file>
+
+		<!-- 2. Objective-C source -->
+		<header-file src="src/ios/TCPServer.h" />
 		<source-file src="src/ios/TCPServer.m" />
-		<source-file src="src/ios/TCPServer.h" />
+
+		<!-- 3. SystemConfiguration.framework
+		        Required for SCNetworkReachabilityCreateWithName / callbacks.
+		        Cordova links it at Xcode build time.
+		        Also declared in tcpserver.podspec for Capacitor / npm installs. -->
+		<framework src="SystemConfiguration.framework" />
+
 	</platform>
+
 </plugin>

@@ -1,6 +1,6 @@
 {
   "name": "tcpserver",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "This is the android and iOS cordova plugin to act as a TCP/IP Server to receive messages from the TCP/IP client",
   "main": "index.js",
   "scripts": {

@@ -1,5 +1,4 @@
 
-
 package cordova_plugin_tcp_server;
 
 import org.apache.cordova.CordovaPlugin;
@@ -11,300 +10,624 @@ import org.json.JSONException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.ByteArrayOutputStream;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketException;
 import java.net.SocketTimeoutException;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.net.ConnectivityManager;
+import android.net.NetworkCapabilities;
+import android.net.NetworkInfo;
+import android.net.NetworkRequest;
 import android.util.Base64;
 import android.util.Log;
 
 public class TCPServer extends CordovaPlugin {
-  private static final String TAG = "TCPServer";
-  private static final int DEFAULT_PORT = 8443;
-  private static final int BUFFER_SIZE = 8192;
-  private static final int SERVER_SO_TIMEOUT = 1000; // For accept() loop checks
 
-  private volatile ServerSocket serverSocket;
-  private final ConcurrentHashMap<String, Socket> clientSockets = new ConcurrentHashMap<>();
-  private final ExecutorService threadPool = Executors.newCachedThreadPool();
-  private final AtomicBoolean isRunning = new AtomicBoolean(false);
+    private static final String TAG = "TCPServer";
+    private static final int DEFAULT_PORT            = 8443;
+    private static final int BUFFER_SIZE             = 8192;
+    private static final int SERVER_SO_TIMEOUT_MS    = 1000;   // accept() poll interval
+    private static final int CLIENT_SO_TIMEOUT_MS    = 30000;  // 30 s per-client read timeout
 
-  @Override
-  public boolean execute(String action, JSONArray args, CallbackContext callbackContext)
-          throws JSONException {
-    switch (action) {
-      case "startServer":
-        int port = args.optInt(0, DEFAULT_PORT);
-        startServer(port, callbackContext);
-        return true;
+    // Watchdog / auto-recovery
+    private static final int MAX_RESTART_ATTEMPTS    = 10;     // per watchdog cycle
+    private static final int RESTART_BASE_DELAY_MS   = 1000;   // initial back-off delay
+    private static final int RESTART_MAX_DELAY_MS    = 30000;  // cap at 30 s
+    private static final int BIND_RETRY_COUNT        = 5;      // port-bind retries
+    private static final int BIND_RETRY_DELAY_MS     = 500;
 
-      case "stopServer":
-        stopServer(callbackContext);
-        return true;
+    // ── State ──
+    private volatile ServerSocket           serverSocket;
+    private final ConcurrentHashMap<String, Socket> clientSockets = new ConcurrentHashMap<>();
+    private volatile ExecutorService        threadPool;
+    private final ScheduledExecutorService  watchdogScheduler = Executors.newSingleThreadScheduledExecutor();
+    private volatile ScheduledFuture<?>     watchdogFuture;
 
-      case "restartServer":
-        int newPort = args.optInt(0, DEFAULT_PORT);
-        restartServer(newPort, callbackContext);
-        return true;
+    private final AtomicBoolean  isRunning        = new AtomicBoolean(false);
+    private final AtomicBoolean  serverIntentional = new AtomicBoolean(false); // true = user started server
+    private final AtomicInteger  restartAttempts  = new AtomicInteger(0);
+    private volatile int         currentPort      = DEFAULT_PORT;
+    private volatile boolean     debugEnabled     = false;
 
-      default:
-        callbackContext.error("Invalid action: " + action);
-        return false;
+    // Callback kept alive for the lifetime of the server session
+    private volatile CallbackContext serverCallbackContext;
+
+    // Network-change listeners (modern API 24+ callback OR legacy broadcast receiver)
+    private BroadcastReceiver                networkReceiver;
+    private ConnectivityManager.NetworkCallback networkCallback;
+    private boolean                          networkReceiverRegistered = false;
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Lifecycle
+    // ────────────────────────────────────────────────────────────────────────
+
+    @Override
+    public void pluginInitialize() {
+        ensureThreadPool();
+        registerNetworkReceiver();
+        logDebug("Plugin initialized");
     }
-  }
 
-  private synchronized void startServer(int port, CallbackContext callbackContext) {
-    if (isRunning.get()) {
-      callbackContext.error("Server already running");
-      return;
+    @Override
+    public void onDestroy() {
+        Log.i(TAG, "Plugin destroying…");
+        serverIntentional.set(false);
+        unregisterNetworkReceiver();
+        cancelWatchdog();
+        forceCleanup();
+        shutdownThreadPool();
+        Log.i(TAG, "Plugin destroyed");
     }
 
-    threadPool.execute(() -> {
-      try {
-        serverSocket = new ServerSocket(port);
-        serverSocket.setReuseAddress(true);
-        serverSocket.setSoTimeout(SERVER_SO_TIMEOUT); // Allow periodic checks
-        isRunning.set(true);
+    @Override
+    public void onReset() {
+        // WebView navigated – keep the server running so the new page can re-attach
+        Log.i(TAG, "Plugin reset (WebView navigation)");
+        logDebug("onReset() – server kept alive for re-attach");
+    }
 
-        sendStatus(callbackContext, "STARTED|" + port);
-        Log.i(TAG, "Server started on port: " + port);
+    // ────────────────────────────────────────────────────────────────────────
+    // Cordova dispatch
+    // ────────────────────────────────────────────────────────────────────────
 
-        acceptLoop(callbackContext);
+    @Override
+    public boolean execute(String action, JSONArray args, CallbackContext callbackContext)
+            throws JSONException {
+        logDebug("execute() action=" + action + " args=" + args);
 
-      } catch (IOException e) {
-        Log.e(TAG, "Failed to start server", e);
-        callbackContext.error("Start error: " + e.getMessage());
-        isRunning.set(false);
-      } finally {
-        isRunning.set(false);
-        Log.i(TAG, "Server accept loop ended");
-      }
-    });
-  }
-
-  private void acceptLoop(CallbackContext callbackContext) {
-    while (isRunning.get()) {
-      try {
-        Socket clientSocket = serverSocket.accept();
-
-        String clientKey = getClientKey(clientSocket);
-        Log.i(TAG, "Client connected: " + clientKey);
-
-        // Store the socket
-        Socket existing = clientSockets.put(clientKey, clientSocket);
-        if (existing != null) {
-          Log.w(TAG, "Replacing existing connection: " + clientKey);
-          safeClose(existing);
+        switch (action) {
+            case "startServer": {
+                int port = args.optInt(0, DEFAULT_PORT);
+                startServer(port, callbackContext);
+                return true;
+            }
+            case "stopServer": {
+                stopServer(callbackContext);
+                return true;
+            }
+            case "restartServer": {
+                int port = args.optInt(0, DEFAULT_PORT);
+                restartServer(port, callbackContext);
+                return true;
+            }
+            case "setDebugLogging": {
+                boolean enabled = args.optBoolean(0, false);
+                setDebugLogging(enabled, callbackContext);
+                return true;
+            }
+            case "getStatus": {
+                getStatus(callbackContext);
+                return true;
+            }
+            default:
+                Log.w(TAG, "Invalid action: " + action);
+                callbackContext.error("Invalid action: " + action);
+                return false;
         }
+    }
 
-        sendStatus(callbackContext, "CONNECTED|" + clientKey);
+    // ────────────────────────────────────────────────────────────────────────
+    // Public actions
+    // ────────────────────────────────────────────────────────────────────────
 
-        // Handle client in separate thread
-        handleClient(clientSocket, callbackContext);
+    private void setDebugLogging(boolean enabled, CallbackContext cb) {
+        debugEnabled = enabled;
+        Log.i(TAG, "Debug logging " + (enabled ? "ENABLED" : "DISABLED"));
+        cb.success("Debug logging " + (enabled ? "enabled" : "disabled"));
+    }
 
-      } catch (SocketTimeoutException e) {
-        // Normal timeout - check if still running and continue
-        continue;
-      } catch (SocketException e) {
+    private void getStatus(CallbackContext cb) {
+        String status = isRunning.get()
+                ? "RUNNING|" + currentPort
+                : "STOPPED";
+        cb.success(status);
+    }
+
+    private synchronized void startServer(int port, CallbackContext callbackContext) {
+        logDebug("startServer() port=" + port + " isRunning=" + isRunning.get());
+
         if (isRunning.get()) {
-          Log.e(TAG, "Socket error during accept", e);
+            Log.w(TAG, "startServer() – server already running on port " + currentPort);
+            // Re-register callback so the new page receives events after WebView reload
+            serverCallbackContext = callbackContext;
+            sendStatus("STARTED|" + currentPort);
+            return;
         }
-        break;
-      } catch (IOException e) {
-        if (isRunning.get()) {
-          Log.e(TAG, "Accept error", e);
-        }
-      }
+
+        serverCallbackContext = callbackContext;
+        currentPort           = port;
+        serverIntentional.set(true);
+        restartAttempts.set(0);
+        ensureThreadPool();
+
+        threadPool.execute(() -> doStartWithRetry(port));
     }
-  }
 
-  private void handleClient(Socket clientSocket, CallbackContext callbackContext) {
-    threadPool.execute(() -> {
-      String clientKey = getClientKey(clientSocket);
+    private synchronized void stopServer(CallbackContext callbackContext) {
+        logDebug("stopServer() isRunning=" + isRunning.get());
 
-      try (InputStream input = clientSocket.getInputStream()) {
+        serverIntentional.set(false);
+        cancelWatchdog();
 
-        // Read all data until client closes connection
-        byte[] data = readStream(input);
+        if (!isRunning.getAndSet(false)) {
+            callbackContext.error("Server not running");
+            return;
+        }
 
-        if (data.length > 0) {
-          // Convert complete data to base64
-          String base64Data = Base64.encodeToString(data, Base64.NO_WRAP);
+        ensureThreadPool();
+        threadPool.execute(() -> {
+            forceCleanup();
+            callbackContext.success("Server stopped");
+            Log.i(TAG, "Server stopped by user");
+        });
+    }
 
-          // Send complete base64 data at once
-          sendStatus(callbackContext, "DATA|" + clientKey + "|" + base64Data);
+    private synchronized void restartServer(int port, CallbackContext callbackContext) {
+        logDebug("restartServer() port=" + port);
+        serverCallbackContext = callbackContext;
+        currentPort           = port;
+        serverIntentional.set(true);
+        restartAttempts.set(0);
+        cancelWatchdog();
 
-          Log.i(TAG, "Received " + data.length + " bytes from: " + clientKey);
+        ensureThreadPool();
+        threadPool.execute(() -> {
+            forceCleanup();
+            sleepMs(500);
+            doStartWithRetry(port);
+        });
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Core start with port-bind retry
+    // ────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Attempts to bind and start the server, retrying on EADDRINUSE up to
+     * BIND_RETRY_COUNT times before giving up and scheduling the watchdog.
+     */
+    private void doStartWithRetry(int port) {
+        for (int attempt = 1; attempt <= BIND_RETRY_COUNT; attempt++) {
+            try {
+                logDebug("doStartWithRetry() attempt=" + attempt + " port=" + port);
+                serverSocket = new ServerSocket();
+                serverSocket.setReuseAddress(true);
+                serverSocket.setSoTimeout(SERVER_SO_TIMEOUT_MS);
+                serverSocket.bind(new InetSocketAddress(port));
+                isRunning.set(true);
+                restartAttempts.set(0);
+
+                String startMsg = (attempt == 1) ? "STARTED|" + port : "RESTARTED|" + port;
+                sendStatus(startMsg);
+                Log.i(TAG, "Server started on port " + port + " (attempt " + attempt + ")");
+
+                // Blocks until the accept loop exits
+                acceptLoop();
+
+                // Accept loop exited – trigger watchdog if still intended to run
+                if (serverIntentional.get()) {
+                    String reason = "Accept loop exited unexpectedly";
+                    Log.w(TAG, reason);
+                    sendStatus("CONNECTION_FAILED|SERVER|" + reason);
+                    scheduleWatchdog();
+                }
+                return; // exit the retry loop
+
+            } catch (IOException e) {
+                safeClose(serverSocket);
+                serverSocket = null;
+                isRunning.set(false);
+
+                String msg = friendlyError(e);
+                Log.e(TAG, "Bind attempt " + attempt + " failed: " + msg);
+
+                if (attempt < BIND_RETRY_COUNT) {
+                    sendStatus("CONNECTION_FAILED|SERVER|Bind attempt " + attempt + " failed: "
+                            + msg + " – retrying…");
+                    sleepMs(BIND_RETRY_DELAY_MS * attempt);
+                } else {
+                    sendStatus("CONNECTION_FAILED|SERVER|Unable to bind on port " + port
+                            + " after " + BIND_RETRY_COUNT + " attempts: " + msg);
+                    if (serverIntentional.get()) {
+                        scheduleWatchdog();
+                    }
+                }
+            }
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Accept loop
+    // ────────────────────────────────────────────────────────────────────────
+
+    private void acceptLoop() {
+        logDebug("acceptLoop() entered");
+
+        while (isRunning.get()) {
+            try {
+                Socket clientSocket = serverSocket.accept();
+                String clientKey    = getClientKey(clientSocket);
+                Log.i(TAG, "Client connected: " + clientKey);
+
+                try {
+                    clientSocket.setSoTimeout(CLIENT_SO_TIMEOUT_MS);
+                    clientSocket.setKeepAlive(true);
+                    clientSocket.setTcpNoDelay(true);
+                } catch (SocketException se) {
+                    Log.e(TAG, "Socket config failed [" + clientKey + "]: " + se.getMessage());
+                    sendStatus("CONNECTION_FAILED|" + clientKey
+                            + "|Socket configuration error – " + se.getMessage());
+                    safeClose(clientSocket);
+                    continue;
+                }
+
+                Socket existing = clientSockets.put(clientKey, clientSocket);
+                if (existing != null) {
+                    logDebug("Replacing stale connection: " + clientKey);
+                    safeClose(existing);
+                }
+
+                sendStatus("CONNECTED|" + clientKey);
+                ensureThreadPool();
+                threadPool.execute(() -> handleClient(clientSocket, clientKey));
+
+            } catch (SocketTimeoutException ignored) {
+                // Normal poll tick
+
+            } catch (SocketException e) {
+                if (isRunning.get()) {
+                    Log.e(TAG, "Accept error: " + e.getMessage());
+                    sendStatus("CONNECTION_FAILED|SERVER|Accept socket error: " + friendlyError(e));
+                }
+                break;
+
+            } catch (IOException e) {
+                if (isRunning.get()) {
+                    Log.e(TAG, "Accept IO error: " + e.getMessage());
+                    sendStatus("CONNECTION_FAILED|SERVER|Accept IO error: " + friendlyError(e));
+                }
+                break;
+            }
+        }
+
+        isRunning.set(false);
+        logDebug("acceptLoop() exited");
+        Log.i(TAG, "Accept loop ended");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Client handling
+    // ────────────────────────────────────────────────────────────────────────
+
+    private void handleClient(Socket clientSocket, String clientKey) {
+        logDebug("handleClient() started for: " + clientKey);
+
+        try (InputStream input = clientSocket.getInputStream()) {
+            byte[] data = readStream(input, clientKey);
+
+            if (data.length > 0) {
+                String b64 = Base64.encodeToString(data, Base64.NO_WRAP);
+                sendStatus("DATA|" + clientKey + "|" + b64);
+                Log.i(TAG, "Received " + data.length + " bytes from: " + clientKey);
+            } else {
+                Log.w(TAG, "No data received from: " + clientKey);
+            }
+
+        } catch (SocketTimeoutException e) {
+            Log.w(TAG, "Read timeout [" + clientKey + "]");
+            sendStatus("CONNECTION_FAILED|" + clientKey
+                    + "|Read timeout – client did not send data within 30 s");
+
+        } catch (SocketException e) {
+            Log.e(TAG, "Client socket error [" + clientKey + "]: " + e.getMessage());
+            sendStatus("CONNECTION_FAILED|" + clientKey + "|" + friendlyError(e));
+
+        } catch (IOException e) {
+            Log.e(TAG, "Client IO error [" + clientKey + "]: " + e.getMessage());
+            sendStatus("CONNECTION_FAILED|" + clientKey + "|" + friendlyError(e));
+
+        } finally {
+            sendStatus("DISCONNECTED|" + clientKey);
+            safeClose(clientSocket);
+            clientSockets.remove(clientKey);
+            logDebug("handleClient() finished for: " + clientKey
+                    + " remaining=" + clientSockets.size());
+        }
+    }
+
+    private byte[] readStream(InputStream input, String clientKey) throws IOException {
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        byte[] buffer = new byte[BUFFER_SIZE];
+        int bytesRead;
+        while ((bytesRead = input.read(buffer)) != -1) {
+            output.write(buffer, 0, bytesRead);
+            logDebug("readStream() " + clientKey + " chunk=" + bytesRead);
+        }
+        return output.toByteArray();
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Watchdog – auto-recovery with exponential back-off
+    // ────────────────────────────────────────────────────────────────────────
+
+    private synchronized void scheduleWatchdog() {
+        if (!serverIntentional.get()) return;
+
+        int attempts = restartAttempts.incrementAndGet();
+        if (attempts > MAX_RESTART_ATTEMPTS) {
+            Log.e(TAG, "Max restart attempts reached – giving up auto-recovery");
+            sendStatus("CONNECTION_FAILED|SERVER|Server could not recover after "
+                    + MAX_RESTART_ATTEMPTS + " attempts. Please restart the app.");
+            serverIntentional.set(false);
+            return;
+        }
+
+        int shift = Math.min(attempts - 1, 5); // cap at 2^5 = 32× base before MIN clamps
+        long delayMs = Math.min(RESTART_BASE_DELAY_MS * (1L << shift), RESTART_MAX_DELAY_MS);
+        Log.i(TAG, "Watchdog: scheduling restart attempt " + attempts + " in " + delayMs + " ms");
+        sendStatus("CONNECTION_FAILED|SERVER|Auto-recovering in " + (delayMs / 1000) + " s (attempt " + attempts + ")");
+
+        watchdogFuture = watchdogScheduler.schedule(() -> {
+            if (!serverIntentional.get() || isRunning.get()) return;
+            Log.i(TAG, "Watchdog: attempting server restart #" + attempts);
+            ensureThreadPool();
+            threadPool.execute(() -> doStartWithRetry(currentPort));
+        }, delayMs, TimeUnit.MILLISECONDS);
+    }
+
+    private synchronized void cancelWatchdog() {
+        if (watchdogFuture != null && !watchdogFuture.isDone()) {
+            watchdogFuture.cancel(false);
+            logDebug("Watchdog cancelled");
+        }
+        watchdogFuture = null;
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Network-change listener
+    // ────────────────────────────────────────────────────────────────────────
+
+    @SuppressWarnings("deprecation") // CONNECTIVITY_ACTION kept for pre-API-24 devices
+    private void registerNetworkReceiver() {
+        if (networkReceiverRegistered) return;
+
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
+            // Android 7+ (API 24+): Use NetworkCallback — not subject to background restrictions
+            registerNetworkCallback();
         } else {
-          Log.w(TAG, "No data received from: " + clientKey);
+            // Pre-API-24: fall back to broadcast receiver
+            registerLegacyReceiver();
         }
-
-      } catch (IOException e) {
-        Log.e(TAG, "Client error [" + clientKey + "]: " + e.getMessage());
-      } finally {
-        // Always notify disconnection and cleanup
-        sendStatus(callbackContext, "DISCONNECTED|" + clientKey);
-        safeClose(clientSocket);
-        clientSockets.remove(clientKey);
-        Log.i(TAG, "Client disconnected and cleaned up: " + clientKey);
-      }
-    });
-  }
-
-  /**
-   * Reads all data from input stream until client closes connection.
-   * This blocks until the client sends EOF (closes the connection).
-   */
-  private byte[] readStream(InputStream input) throws IOException {
-    ByteArrayOutputStream output = new ByteArrayOutputStream();
-    byte[] buffer = new byte[BUFFER_SIZE];
-    int bytesRead;
-
-    // Read until client closes connection (returns -1)
-    while ((bytesRead = input.read(buffer)) != -1) {
-      output.write(buffer, 0, bytesRead);
     }
 
-    return output.toByteArray();
-  }
+    @android.annotation.TargetApi(android.os.Build.VERSION_CODES.N)
+    private void registerNetworkCallback() {
+        ConnectivityManager cm = (ConnectivityManager)
+                cordova.getActivity().getSystemService(Context.CONNECTIVITY_SERVICE);
+        if (cm == null) return;
 
-  private synchronized void stopServer(CallbackContext callbackContext) {
-    if (!isRunning.getAndSet(false)) {
-      callbackContext.error("Server not running");
-      return;
+        android.net.NetworkRequest request = new android.net.NetworkRequest.Builder()
+                .addCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build();
+
+        networkCallback = new ConnectivityManager.NetworkCallback() {
+            @Override
+            public void onAvailable(android.net.Network network) {
+                Log.i(TAG, "NetworkCallback: network available");
+                if (serverIntentional.get() && !isRunning.get()) {
+                    Log.i(TAG, "Network restored – triggering server auto-recovery");
+                    sendStatus("CONNECTION_FAILED|SERVER|Network restored – reconnecting…");
+                    restartAttempts.set(0);
+                    cancelWatchdog();
+                    ensureThreadPool();
+                    threadPool.execute(() -> doStartWithRetry(currentPort));
+                }
+            }
+
+            @Override
+            public void onLost(android.net.Network network) {
+                Log.w(TAG, "NetworkCallback: network lost");
+                if (isRunning.get()) {
+                    sendStatus("CONNECTION_FAILED|SERVER|Network connectivity lost");
+                }
+            }
+        };
+
+        cm.registerNetworkCallback(request, networkCallback);
+        networkReceiverRegistered = true;
+        logDebug("NetworkCallback registered (API 24+)");
     }
 
-    threadPool.execute(() -> {
-      Log.i(TAG, "Stopping server...");
+    @SuppressWarnings("deprecation")
+    private void registerLegacyReceiver() {
+        networkReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                ConnectivityManager cm = (ConnectivityManager)
+                        context.getSystemService(Context.CONNECTIVITY_SERVICE);
+                @SuppressWarnings("deprecation")
+                NetworkInfo ni = cm != null ? cm.getActiveNetworkInfo() : null;
+                boolean connected = (ni != null && ni.isConnected());
 
-      // Close all client connections
-      clientSockets.forEach((key, socket) -> {
-        Log.i(TAG, "Closing client: " + key);
-        safeClose(socket);
-      });
-      clientSockets.clear();
+                Log.i(TAG, "Network change (broadcast) – connected=" + connected);
 
-      // Close server socket
-      safeClose(serverSocket);
-      serverSocket = null;
+                if (connected && serverIntentional.get() && !isRunning.get()) {
+                    Log.i(TAG, "Network restored – triggering server auto-recovery");
+                    sendStatus("CONNECTION_FAILED|SERVER|Network restored – reconnecting…");
+                    restartAttempts.set(0);
+                    cancelWatchdog();
+                    ensureThreadPool();
+                    threadPool.execute(() -> doStartWithRetry(currentPort));
+                }
 
-      callbackContext.success("Server stopped");
-      Log.i(TAG, "Server stopped successfully");
-    });
-  }
+                if (!connected && isRunning.get()) {
+                    Log.w(TAG, "Network lost – server may drop clients");
+                    sendStatus("CONNECTION_FAILED|SERVER|Network connectivity lost");
+                }
+            }
+        };
 
-  private synchronized void restartServer(int port, CallbackContext callbackContext) {
-    threadPool.execute(() -> {
-      try {
-        if (isRunning.get()) {
-          Log.i(TAG, "Stopping server for restart...");
-          forceCleanup();
-          Thread.sleep(500); // Brief pause for cleanup
+        IntentFilter filter = new IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION);
+        cordova.getActivity().registerReceiver(networkReceiver, filter);
+        networkReceiverRegistered = true;
+        logDebug("Legacy network receiver registered (pre-API 24)");
+    }
+
+    private void unregisterNetworkReceiver() {
+        if (!networkReceiverRegistered) return;
+
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N
+                && networkCallback != null) {
+            try {
+                ConnectivityManager cm = (ConnectivityManager)
+                        cordova.getActivity().getSystemService(Context.CONNECTIVITY_SERVICE);
+                if (cm != null) cm.unregisterNetworkCallback(networkCallback);
+            } catch (Exception ignored) { }
+            networkCallback = null;
+        } else if (networkReceiver != null) {
+            try {
+                cordova.getActivity().unregisterReceiver(networkReceiver);
+            } catch (Exception ignored) { }
+            networkReceiver = null;
         }
 
-        serverSocket = new ServerSocket(port);
-        serverSocket.setReuseAddress(true);
-        serverSocket.setSoTimeout(SERVER_SO_TIMEOUT);
-        isRunning.set(true);
+        networkReceiverRegistered = false;
+        logDebug("Network listener unregistered");
+    }
 
-        sendStatus(callbackContext, "RESTARTED|" + port);
-        Log.i(TAG, "Server restarted on port: " + port);
+    // ────────────────────────────────────────────────────────────────────────
+    // Cleanup helpers
+    // ────────────────────────────────────────────────────────────────────────
 
-        acceptLoop(callbackContext);
-
-      } catch (Exception e) {
-        Log.e(TAG, "Restart failed", e);
-        callbackContext.error("Restart error: " + e.getMessage());
+    private void forceCleanup() {
+        logDebug("forceCleanup() clients=" + clientSockets.size());
         isRunning.set(false);
-      }
-    });
-  }
 
-  private void forceCleanup() {
-    isRunning.set(false);
-
-    // Close all client sockets
-    clientSockets.forEach((key, socket) -> safeClose(socket));
-    clientSockets.clear();
-
-    // Close server socket
-    safeClose(serverSocket);
-  }
-
-  private void safeClose(Socket socket) {
-    if (socket == null) return;
-
-    try {
-      if (!socket.isClosed()) {
-        socket.shutdownInput();
-      }
-    } catch (IOException e) {
-      // Ignore - socket may already be closed
-    }
-
-    try {
-      if (!socket.isClosed()) {
-        socket.shutdownOutput();
-      }
-    } catch (IOException e) {
-      // Ignore - socket may already be closed
-    }
-
-    try {
-      socket.close();
-    } catch (IOException e) {
-      Log.d(TAG, "Error closing socket: " + e.getMessage());
-    }
-  }
-
-  private void safeClose(ServerSocket socket) {
-    if (socket == null) return;
-
-    try {
-      if (!socket.isClosed()) {
-        socket.close();
-      }
-    } catch (IOException e) {
-      Log.d(TAG, "Error closing server socket: " + e.getMessage());
-    }
-  }
-
-  private String getClientKey(Socket socket) {
-    return socket.getInetAddress().getHostAddress() + ":" + socket.getPort();
-  }
-
-  private void sendStatus(CallbackContext ctx, String message) {
-    PluginResult result = new PluginResult(PluginResult.Status.OK, message);
-    result.setKeepCallback(true);
-    ctx.sendPluginResult(result);
-  }
-
-  @Override
-  public void onDestroy() {
-    Log.i(TAG, "Plugin destroying...");
-    forceCleanup();
-
-    threadPool.shutdown();
-    try {
-      if (!threadPool.awaitTermination(5, TimeUnit.SECONDS)) {
-        Log.w(TAG, "Thread pool did not terminate gracefully");
-        threadPool.shutdownNow();
-
-        if (!threadPool.awaitTermination(5, TimeUnit.SECONDS)) {
-          Log.e(TAG, "Thread pool did not terminate");
+        for (Map.Entry<String, Socket> entry : clientSockets.entrySet()) {
+            safeClose(entry.getValue());
         }
-      }
-    } catch (InterruptedException e) {
-      threadPool.shutdownNow();
-      Thread.currentThread().interrupt();
+        clientSockets.clear();
+
+        safeClose(serverSocket);
+        serverSocket = null;
+        logDebug("forceCleanup() done");
     }
 
-    Log.i(TAG, "Plugin destroyed");
-  }
+    private void safeClose(Socket socket) {
+        if (socket == null) return;
+        try { if (!socket.isClosed()) socket.shutdownInput();  } catch (IOException ignored) { }
+        try { if (!socket.isClosed()) socket.shutdownOutput(); } catch (IOException ignored) { }
+        try { socket.close(); } catch (IOException ignored) { }
+    }
+
+    private void safeClose(ServerSocket socket) {
+        if (socket == null) return;
+        try { if (!socket.isClosed()) socket.close(); } catch (IOException ignored) { }
+    }
+
+    private synchronized void ensureThreadPool() {
+        if (threadPool == null || threadPool.isShutdown()) {
+            threadPool = Executors.newCachedThreadPool();
+            logDebug("Thread pool (re)created");
+        }
+    }
+
+    private void shutdownThreadPool() {
+        if (threadPool == null) return;
+        threadPool.shutdown();
+        try {
+            if (!threadPool.awaitTermination(5, TimeUnit.SECONDS)) {
+                threadPool.shutdownNow();
+                threadPool.awaitTermination(5, TimeUnit.SECONDS);
+            }
+        } catch (InterruptedException e) {
+            threadPool.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Utility
+    // ────────────────────────────────────────────────────────────────────────
+
+    private String getClientKey(Socket socket) {
+        return socket.getInetAddress().getHostAddress() + ":" + socket.getPort();
+    }
+
+    /** Returns a concise, human-readable error message suitable for the app UI. */
+    private String friendlyError(Exception e) {
+        String raw = e.getMessage();
+        if (raw == null) raw = e.getClass().getSimpleName();
+        if (raw.contains("EADDRINUSE") || raw.contains("bind failed"))
+            return "Port already in use – another process may be holding port " + currentPort;
+        if (raw.contains("EACCES") || raw.contains("Permission denied"))
+            return "Permission denied – cannot bind to port " + currentPort;
+        if (raw.contains("ENETUNREACH") || raw.contains("Network is unreachable"))
+            return "Network unreachable – check Wi-Fi/LAN connection";
+        if (raw.contains("ECONNRESET") || raw.contains("Connection reset"))
+            return "Connection reset by client";
+        if (raw.contains("EPIPE") || raw.contains("Broken pipe"))
+            return "Connection broken – client disconnected unexpectedly";
+        if (raw.contains("ETIMEDOUT") || raw.contains("timed out"))
+            return "Connection timed out";
+        if (raw.contains("ECONNREFUSED"))
+            return "Connection refused by remote host";
+        return raw;
+    }
+
+    private void sendStatus(String message) {
+        if (serverCallbackContext == null) {
+            Log.w(TAG, "sendStatus() – no callback registered, message=" + message);
+            return;
+        }
+        logDebug("sendStatus() → " + message);
+        PluginResult result = new PluginResult(PluginResult.Status.OK, message);
+        result.setKeepCallback(true);
+        serverCallbackContext.sendPluginResult(result);
+    }
+
+    private void logDebug(String message) {
+        if (debugEnabled) {
+            Log.d(TAG, "[DEBUG][" + Thread.currentThread().getName() + "] " + message);
+        }
+    }
+
+    private void sleepMs(long ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
 }
