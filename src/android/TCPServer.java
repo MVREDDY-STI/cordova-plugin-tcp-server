@@ -49,7 +49,8 @@ public class TCPServer extends CordovaPlugin {
     private static final int RESTART_BASE_DELAY_MS   = 1000;   // initial back-off delay
     private static final int RESTART_MAX_DELAY_MS    = 30000;  // cap at 30 s
     private static final int BIND_RETRY_COUNT        = 5;      // port-bind retries
-    private static final int BIND_RETRY_DELAY_MS     = 500;
+    // FIX: was 500 ms — increased to give OS more time to fully reclaim the port
+    private static final int BIND_RETRY_DELAY_MS     = 800;
 
     // ── State ──
     private volatile ServerSocket           serverSocket;
@@ -58,16 +59,16 @@ public class TCPServer extends CordovaPlugin {
     private final ScheduledExecutorService  watchdogScheduler = Executors.newSingleThreadScheduledExecutor();
     private volatile ScheduledFuture<?>     watchdogFuture;
 
-    private final AtomicBoolean  isRunning        = new AtomicBoolean(false);
-    private final AtomicBoolean  serverIntentional = new AtomicBoolean(false); // true = user started server
-    private final AtomicInteger  restartAttempts  = new AtomicInteger(0);
-    private volatile int         currentPort      = DEFAULT_PORT;
-    private volatile boolean     debugEnabled     = false;
+    private final AtomicBoolean  isRunning         = new AtomicBoolean(false);
+    private final AtomicBoolean  serverIntentional = new AtomicBoolean(false);
+    private final AtomicInteger  restartAttempts   = new AtomicInteger(0);
+    private volatile int         currentPort       = DEFAULT_PORT;
+    private volatile boolean     debugEnabled      = false;
 
     // Callback kept alive for the lifetime of the server session
     private volatile CallbackContext serverCallbackContext;
 
-    // Network-change listeners (modern API 24+ callback OR legacy broadcast receiver)
+    // Network-change listeners
     private BroadcastReceiver                networkReceiver;
     private ConnectivityManager.NetworkCallback networkCallback;
     private boolean                          networkReceiverRegistered = false;
@@ -85,7 +86,7 @@ public class TCPServer extends CordovaPlugin {
 
     @Override
     public void onDestroy() {
-        Log.i(TAG, "Plugin destroying…");
+        Log.i(TAG, "Plugin destroying...");
         serverIntentional.set(false);
         unregisterNetworkReceiver();
         cancelWatchdog();
@@ -96,9 +97,8 @@ public class TCPServer extends CordovaPlugin {
 
     @Override
     public void onReset() {
-        // WebView navigated – keep the server running so the new page can re-attach
         Log.i(TAG, "Plugin reset (WebView navigation)");
-        logDebug("onReset() – server kept alive for re-attach");
+        logDebug("onReset() - server kept alive for re-attach");
     }
 
     // ────────────────────────────────────────────────────────────────────────
@@ -152,20 +152,27 @@ public class TCPServer extends CordovaPlugin {
     }
 
     private void getStatus(CallbackContext cb) {
-        String status = isRunning.get()
-                ? "RUNNING|" + currentPort
-                : "STOPPED";
+        String status = isRunning.get() ? "RUNNING|" + currentPort : "STOPPED";
         cb.success(status);
     }
 
     private synchronized void startServer(int port, CallbackContext callbackContext) {
-        logDebug("startServer() port=" + port + " isRunning=" + isRunning.get());
+        logDebug("startServer() port=" + port + " isRunning=" + isRunning.get()
+                + " currentPort=" + currentPort);
 
-        if (isRunning.get()) {
-            Log.w(TAG, "startServer() – server already running on port " + currentPort);
-            // Re-register callback so the new page receives events after WebView reload
+        if (isRunning.get() && port == currentPort) {
+            // FIX: Same port, already healthy — just re-register callback so the new
+            // page receives events after WebView reload or repeated startServer() calls.
+            Log.i(TAG, "startServer() - already running on port " + currentPort + "; re-registering callback");
             serverCallbackContext = callbackContext;
             sendStatus("STARTED|" + currentPort);
+            return;
+        }
+
+        if (isRunning.get() && port != currentPort) {
+            // FIX: Different port requested while already running — stop + restart cleanly.
+            Log.i(TAG, "startServer() - port change " + currentPort + " -> " + port + "; restarting");
+            restartServer(port, callbackContext);
             return;
         }
 
@@ -174,7 +181,6 @@ public class TCPServer extends CordovaPlugin {
         serverIntentional.set(true);
         restartAttempts.set(0);
         ensureThreadPool();
-
         threadPool.execute(() -> doStartWithRetry(port));
     }
 
@@ -185,6 +191,8 @@ public class TCPServer extends CordovaPlugin {
         cancelWatchdog();
 
         if (!isRunning.getAndSet(false)) {
+            // Not running — still run cleanup to release any stale/partially-bound socket
+            forceCleanup();
             callbackContext.error("Server not running");
             return;
         }
@@ -208,7 +216,9 @@ public class TCPServer extends CordovaPlugin {
         ensureThreadPool();
         threadPool.execute(() -> {
             forceCleanup();
-            sleepMs(500);
+            // FIX: Increased grace period from 500 ms to 1000 ms so the OS
+            // has enough time to fully reclaim the port before the next bind.
+            sleepMs(1000);
             doStartWithRetry(port);
         });
     }
@@ -219,12 +229,23 @@ public class TCPServer extends CordovaPlugin {
 
     /**
      * Attempts to bind and start the server, retrying on EADDRINUSE up to
-     * BIND_RETRY_COUNT times before giving up and scheduling the watchdog.
+     * BIND_RETRY_COUNT times with linearly increasing back-off.
+     *
+     * FIX (primary): Each attempt now calls safeClose(serverSocket) before
+     * creating a new ServerSocket. This guarantees the stale socket from the
+     * previous attempt (or from the previous accept loop) is fully closed
+     * before we try to bind again. SO_REUSEADDR alone is not sufficient when
+     * the same process still owns the socket.
      */
     private void doStartWithRetry(int port) {
         for (int attempt = 1; attempt <= BIND_RETRY_COUNT; attempt++) {
             try {
                 logDebug("doStartWithRetry() attempt=" + attempt + " port=" + port);
+
+                // FIX: Close any lingering socket before each bind attempt.
+                safeClose(serverSocket);
+                serverSocket = null;
+
                 serverSocket = new ServerSocket();
                 serverSocket.setReuseAddress(true);
                 serverSocket.setSoTimeout(SERVER_SO_TIMEOUT_MS);
@@ -236,19 +257,19 @@ public class TCPServer extends CordovaPlugin {
                 sendStatus(startMsg);
                 Log.i(TAG, "Server started on port " + port + " (attempt " + attempt + ")");
 
-                // Blocks until the accept loop exits
-                acceptLoop();
+                acceptLoop(); // blocks until loop exits
 
-                // Accept loop exited – trigger watchdog if still intended to run
                 if (serverIntentional.get()) {
                     String reason = "Accept loop exited unexpectedly";
                     Log.w(TAG, reason);
                     sendStatus("CONNECTION_FAILED|SERVER|" + reason);
                     scheduleWatchdog();
                 }
-                return; // exit the retry loop
+                return;
 
             } catch (IOException e) {
+                // FIX: Always close the partially-created socket so it doesn't
+                // accumulate and keep the port reserved across retry iterations.
                 safeClose(serverSocket);
                 serverSocket = null;
                 isRunning.set(false);
@@ -258,8 +279,9 @@ public class TCPServer extends CordovaPlugin {
 
                 if (attempt < BIND_RETRY_COUNT) {
                     sendStatus("CONNECTION_FAILED|SERVER|Bind attempt " + attempt + " failed: "
-                            + msg + " – retrying…");
-                    sleepMs(BIND_RETRY_DELAY_MS * attempt);
+                            + msg + " - retrying...");
+                    // Linearly increasing back-off: 800 ms, 1600 ms, 2400 ms, 3200 ms
+                    sleepMs((long) BIND_RETRY_DELAY_MS * attempt);
                 } else {
                     sendStatus("CONNECTION_FAILED|SERVER|Unable to bind on port " + port
                             + " after " + BIND_RETRY_COUNT + " attempts: " + msg);
@@ -291,7 +313,7 @@ public class TCPServer extends CordovaPlugin {
                 } catch (SocketException se) {
                     Log.e(TAG, "Socket config failed [" + clientKey + "]: " + se.getMessage());
                     sendStatus("CONNECTION_FAILED|" + clientKey
-                            + "|Socket configuration error – " + se.getMessage());
+                            + "|Socket configuration error - " + se.getMessage());
                     safeClose(clientSocket);
                     continue;
                 }
@@ -307,7 +329,7 @@ public class TCPServer extends CordovaPlugin {
                 threadPool.execute(() -> handleClient(clientSocket, clientKey));
 
             } catch (SocketTimeoutException ignored) {
-                // Normal poll tick
+                // Normal poll tick — continue
 
             } catch (SocketException e) {
                 if (isRunning.get()) {
@@ -351,7 +373,7 @@ public class TCPServer extends CordovaPlugin {
         } catch (SocketTimeoutException e) {
             Log.w(TAG, "Read timeout [" + clientKey + "]");
             sendStatus("CONNECTION_FAILED|" + clientKey
-                    + "|Read timeout – client did not send data within 30 s");
+                    + "|Read timeout - client did not send data within 30 s");
 
         } catch (SocketException e) {
             Log.e(TAG, "Client socket error [" + clientKey + "]: " + e.getMessage());
@@ -390,21 +412,31 @@ public class TCPServer extends CordovaPlugin {
 
         int attempts = restartAttempts.incrementAndGet();
         if (attempts > MAX_RESTART_ATTEMPTS) {
-            Log.e(TAG, "Max restart attempts reached – giving up auto-recovery");
+            Log.e(TAG, "Max restart attempts reached - giving up auto-recovery");
             sendStatus("CONNECTION_FAILED|SERVER|Server could not recover after "
                     + MAX_RESTART_ATTEMPTS + " attempts. Please restart the app.");
             serverIntentional.set(false);
             return;
         }
 
-        int shift = Math.min(attempts - 1, 5); // cap at 2^5 = 32× base before MIN clamps
+        int shift = Math.min(attempts - 1, 5);
         long delayMs = Math.min(RESTART_BASE_DELAY_MS * (1L << shift), RESTART_MAX_DELAY_MS);
         Log.i(TAG, "Watchdog: scheduling restart attempt " + attempts + " in " + delayMs + " ms");
-        sendStatus("CONNECTION_FAILED|SERVER|Auto-recovering in " + (delayMs / 1000) + " s (attempt " + attempts + ")");
+        sendStatus("CONNECTION_FAILED|SERVER|Auto-recovering in " + (delayMs / 1000)
+                + " s (attempt " + attempts + ")");
 
         watchdogFuture = watchdogScheduler.schedule(() -> {
             if (!serverIntentional.get() || isRunning.get()) return;
             Log.i(TAG, "Watchdog: attempting server restart #" + attempts);
+
+            // FIX (primary): Always call forceCleanup() here before retrying.
+            // The stale ServerSocket from the previous accept loop may still be
+            // holding the port even though isRunning==false. Without this call,
+            // every watchdog retry sees EADDRINUSE because the old socket was
+            // never closed — causing the infinite retry loop you observed.
+            forceCleanup();
+            sleepMs(500); // brief OS grace period before rebinding
+
             ensureThreadPool();
             threadPool.execute(() -> doStartWithRetry(currentPort));
         }, delayMs, TimeUnit.MILLISECONDS);
@@ -422,15 +454,13 @@ public class TCPServer extends CordovaPlugin {
     // Network-change listener
     // ────────────────────────────────────────────────────────────────────────
 
-    @SuppressWarnings("deprecation") // CONNECTIVITY_ACTION kept for pre-API-24 devices
+    @SuppressWarnings("deprecation")
     private void registerNetworkReceiver() {
         if (networkReceiverRegistered) return;
 
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
-            // Android 7+ (API 24+): Use NetworkCallback — not subject to background restrictions
             registerNetworkCallback();
         } else {
-            // Pre-API-24: fall back to broadcast receiver
             registerLegacyReceiver();
         }
     }
@@ -450,10 +480,13 @@ public class TCPServer extends CordovaPlugin {
             public void onAvailable(android.net.Network network) {
                 Log.i(TAG, "NetworkCallback: network available");
                 if (serverIntentional.get() && !isRunning.get()) {
-                    Log.i(TAG, "Network restored – triggering server auto-recovery");
-                    sendStatus("CONNECTION_FAILED|SERVER|Network restored – reconnecting…");
+                    Log.i(TAG, "Network restored - triggering server auto-recovery");
+                    sendStatus("CONNECTION_FAILED|SERVER|Network restored - reconnecting...");
                     restartAttempts.set(0);
                     cancelWatchdog();
+                    // FIX: cleanup before network-triggered restart too
+                    forceCleanup();
+                    sleepMs(500);
                     ensureThreadPool();
                     threadPool.execute(() -> doStartWithRetry(currentPort));
                 }
@@ -484,19 +517,22 @@ public class TCPServer extends CordovaPlugin {
                 NetworkInfo ni = cm != null ? cm.getActiveNetworkInfo() : null;
                 boolean connected = (ni != null && ni.isConnected());
 
-                Log.i(TAG, "Network change (broadcast) – connected=" + connected);
+                Log.i(TAG, "Network change (broadcast) - connected=" + connected);
 
                 if (connected && serverIntentional.get() && !isRunning.get()) {
-                    Log.i(TAG, "Network restored – triggering server auto-recovery");
-                    sendStatus("CONNECTION_FAILED|SERVER|Network restored – reconnecting…");
+                    Log.i(TAG, "Network restored - triggering server auto-recovery");
+                    sendStatus("CONNECTION_FAILED|SERVER|Network restored - reconnecting...");
                     restartAttempts.set(0);
                     cancelWatchdog();
+                    // FIX: cleanup before network-triggered restart too
+                    forceCleanup();
+                    sleepMs(500);
                     ensureThreadPool();
                     threadPool.execute(() -> doStartWithRetry(currentPort));
                 }
 
                 if (!connected && isRunning.get()) {
-                    Log.w(TAG, "Network lost – server may drop clients");
+                    Log.w(TAG, "Network lost - server may drop clients");
                     sendStatus("CONNECTION_FAILED|SERVER|Network connectivity lost");
                 }
             }
@@ -589,20 +625,19 @@ public class TCPServer extends CordovaPlugin {
         return socket.getInetAddress().getHostAddress() + ":" + socket.getPort();
     }
 
-    /** Returns a concise, human-readable error message suitable for the app UI. */
     private String friendlyError(Exception e) {
         String raw = e.getMessage();
         if (raw == null) raw = e.getClass().getSimpleName();
         if (raw.contains("EADDRINUSE") || raw.contains("bind failed"))
-            return "Port already in use – another process may be holding port " + currentPort;
+            return "Port already in use - another process may be holding port " + currentPort;
         if (raw.contains("EACCES") || raw.contains("Permission denied"))
-            return "Permission denied – cannot bind to port " + currentPort;
+            return "Permission denied - cannot bind to port " + currentPort;
         if (raw.contains("ENETUNREACH") || raw.contains("Network is unreachable"))
-            return "Network unreachable – check Wi-Fi/LAN connection";
+            return "Network unreachable - check Wi-Fi/LAN connection";
         if (raw.contains("ECONNRESET") || raw.contains("Connection reset"))
             return "Connection reset by client";
         if (raw.contains("EPIPE") || raw.contains("Broken pipe"))
-            return "Connection broken – client disconnected unexpectedly";
+            return "Connection broken - client disconnected unexpectedly";
         if (raw.contains("ETIMEDOUT") || raw.contains("timed out"))
             return "Connection timed out";
         if (raw.contains("ECONNREFUSED"))
@@ -612,10 +647,10 @@ public class TCPServer extends CordovaPlugin {
 
     private void sendStatus(String message) {
         if (serverCallbackContext == null) {
-            Log.w(TAG, "sendStatus() – no callback registered, message=" + message);
+            Log.w(TAG, "sendStatus() - no callback registered, message=" + message);
             return;
         }
-        logDebug("sendStatus() → " + message);
+        logDebug("sendStatus() -> " + message);
         PluginResult result = new PluginResult(PluginResult.Status.OK, message);
         result.setKeepCallback(true);
         serverCallbackContext.sendPluginResult(result);
