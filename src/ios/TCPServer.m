@@ -25,6 +25,9 @@ static const int kRestartMaxDelayMs    = 30000;
 @property (nonatomic, assign) int          serverFd;
 @property (atomic,    assign) BOOL         isRunning;
 @property (atomic,    assign) BOOL         serverIntentional; // user started
+// Guards against a queued reachability/watchdog start firing right behind
+// an already-in-progress start on the serial acceptQueue.
+@property (atomic,    assign) BOOL         startInProgress;
 @property (nonatomic, assign) BOOL         debugEnabled;
 @property (nonatomic, assign) int          currentPort;
 @property (nonatomic, assign) int          restartAttempts;
@@ -52,6 +55,7 @@ static const int kRestartMaxDelayMs    = 30000;
     self.serverFd           = -1;
     self.isRunning          = NO;
     self.serverIntentional  = NO;
+    self.startInProgress    = NO;
     self.debugEnabled       = NO;
     self.currentPort        = 0;
     self.restartAttempts    = 0;
@@ -162,8 +166,17 @@ static const int kRestartMaxDelayMs    = 30000;
  * Attempts to create, bind, and listen the server socket.
  * Retries up to kBindRetryCount times on EADDRINUSE before giving up.
  * On success, enters the run-loop synchronously (blocking the acceptQueue thread).
+ *
+ * Although acceptQueue is serial (so true parallel execution is impossible),
+ * a queued recovery task can run immediately after the current one finishes.
+ * startInProgress lets a queued task detect there's nothing to do.
  */
 - (void)doStartWithRetry:(int)port {
+    if (self.startInProgress) {
+        [self logDebug:@"doStartWithRetry() – start already in progress; skipping queued call"];
+        return;
+    }
+    self.startInProgress = YES;
     for (int attempt = 1; attempt <= kBindRetryCount; attempt++) {
         [self logDebug:[NSString stringWithFormat:@"doStartWithRetry() attempt=%d port=%d", attempt, port]];
 
@@ -175,6 +188,9 @@ static const int kRestartMaxDelayMs    = 30000;
             [self sendStatus:msg];
             self.restartAttempts = 0;
             NSLog(@"TCPServer: Server started on port %d (attempt %d)", port, attempt);
+            // Release guard before the blocking accept loop so stop/restart
+            // commands issued later can queue a new start.
+            self.startInProgress = NO;
             [self doAcceptLoop];
 
             // doAcceptLoop returned – check if we should auto-recover
@@ -201,6 +217,7 @@ static const int kRestartMaxDelayMs    = 30000;
             }
         }
     }
+    self.startInProgress = NO;
 }
 
 /** Creates, binds, and listens the server socket. Returns YES on success. */
@@ -420,7 +437,7 @@ static const int kRestartMaxDelayMs    = 30000;
     dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, interval), DISPATCH_TIME_FOREVER, NSEC_PER_MSEC * 100);
     dispatch_source_set_event_handler(timer, ^{
         dispatch_source_cancel(timer);
-        if (!self.serverIntentional || self.isRunning) return;
+        if (!self.serverIntentional || self.isRunning || self.startInProgress) return;
         NSLog(@"TCPServer: Watchdog firing restart #%d", self.restartAttempts);
         dispatch_async(self.acceptQueue, ^{
             [self doStartWithRetry:self.currentPort];
@@ -447,12 +464,14 @@ static void ReachabilityCallback(SCNetworkReachabilityRef target, SCNetworkReach
     NSLog(@"TCPServer: Network reachability changed – reachable=%d isRunning=%d intended=%d",
           reachable, self_.isRunning, self_.serverIntentional);
 
-    if (reachable && self_.serverIntentional && !self_.isRunning) {
+    if (reachable && self_.serverIntentional && !self_.isRunning && !self_.startInProgress) {
         NSLog(@"TCPServer: Network restored – triggering auto-recovery");
         [self_ sendStatus:@"CONNECTION_FAILED|SERVER|Network restored – reconnecting…"];
         self_.restartAttempts = 0;
         [self_ cancelWatchdog];
+        [self_ forceCleanup];
         dispatch_async(self_.acceptQueue, ^{
+            [NSThread sleepForTimeInterval:0.5];
             [self_ doStartWithRetry:self_.currentPort];
         });
     }
